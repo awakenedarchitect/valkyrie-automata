@@ -99,6 +99,8 @@ class Echo:
         self._subscribers: list[Callable] = []
         self._conn = self._open_db()
         self._ensure_schema()
+        self._tfidf = _TfIdf()
+        self._index_dirty = True  # rebuild on next recall
 
     # ── pub/sub ─────────────────────────────────────────────────
 
@@ -154,6 +156,15 @@ class Echo:
             CREATE INDEX IF NOT EXISTS idx_keywords ON memories(keywords);
         """)
         self._conn.commit()
+
+    # ── TF-IDF index ──────────────────────────────────────────
+
+    def _rebuild_index(self):
+        """Rebuild TF-IDF index from all memory summaries."""
+        rows = self._conn.execute("SELECT id, summary FROM memories").fetchall()
+        docs = {row["id"]: row["summary"] for row in rows}
+        self._tfidf.build(docs)
+        self._index_dirty = False
 
     # ── encode (store a new memory) ─────────────────────────────
 
@@ -217,6 +228,7 @@ class Echo:
             )
         )
         self._conn.commit()
+        self._index_dirty = True  # new memory invalidates TF-IDF index
 
         self._notify("encoded", {
             "id": mid, "importance": importance,
@@ -272,19 +284,21 @@ class Echo:
         if not rows:
             return []
 
-        now = time.time()
-        query_kw = set(query.lower().split()) if query else set()
+        # rebuild TF-IDF index if needed
+        if self._index_dirty:
+            self._rebuild_index()
 
-        # score each memory: relevance + importance + recency
+        now = time.time()
+
+        # score each memory: semantic similarity + importance + recency
         scored = []
         for row in rows:
-            # text relevance
-            if query_kw:
-                mem_kw = set(row["keywords"].split())
-                overlap = len(query_kw & mem_kw)
-                summary_lower = row["summary"].lower()
-                phrase_hit = 1.0 if query.lower() in summary_lower else 0.0
-                relevance = min(1.0, (overlap / max(len(query_kw), 1)) * 0.7 + phrase_hit * 0.3)
+            # semantic relevance via TF-IDF cosine similarity
+            if query:
+                relevance = self._tfidf.similarity(query, row["id"])
+                # boost for exact phrase match (cosine can miss short queries)
+                if query.lower() in row["summary"].lower():
+                    relevance = min(1.0, relevance + 0.3)
             else:
                 relevance = 0.5  # no query = return by importance/recency
 
@@ -408,6 +422,20 @@ class Echo:
             for row in rows
         ]
 
+    def find_similar(self, memory_id: str, k: int = 5,
+                     min_score: float = 0.1) -> list[tuple[str, float]]:
+        """Find memories semantically similar to a given memory.
+
+        Used by reverie.py during dream cycles to discover hidden
+        connections between memories that share meaning but not words.
+
+        Returns [(memory_id, similarity_score)] sorted by score desc.
+        """
+        if self._index_dirty:
+            self._rebuild_index()
+        pairs = self._tfidf.similar_to_doc(memory_id, k=k)
+        return [(mid, score) for mid, score in pairs if score >= min_score]
+
     # ── decay and tick ──────────────────────────────────────────
 
     def tick(self, dt: float = 1.0):
@@ -461,6 +489,7 @@ class Echo:
         self._conn.commit()
         pruned = cursor.rowcount
         if pruned:
+            self._index_dirty = True
             self._notify("pruned", {"count": pruned, "threshold": threshold})
         return pruned
 
@@ -575,6 +604,7 @@ class Echo:
                b NOT IN (SELECT id FROM memories)"""
         )
         self._conn.commit()
+        self._index_dirty = True  # corpus changed
 
         self._notify("merged", {
             "from": memory_ids, "to": new_id,
@@ -721,30 +751,8 @@ def _make_id(summary: str, ts: float, seed: int) -> str:
     return hashlib.sha256(raw).hexdigest()[:16]
 
 def _extract_keywords(text: str) -> str:
-    """Rough keyword extraction. No NLP libs needed.
-    Strips common words, returns space-separated lowercase tokens."""
-    stop = {
-        "the", "a", "an", "is", "was", "were", "are", "be", "been",
-        "being", "have", "has", "had", "do", "does", "did", "will",
-        "would", "could", "should", "may", "might", "shall", "can",
-        "to", "of", "in", "for", "on", "with", "at", "by", "from",
-        "as", "into", "through", "during", "before", "after", "above",
-        "below", "between", "out", "off", "over", "under", "again",
-        "further", "then", "once", "here", "there", "when", "where",
-        "why", "how", "all", "each", "every", "both", "few", "more",
-        "most", "other", "some", "such", "no", "nor", "not", "only",
-        "own", "same", "so", "than", "too", "very", "just", "because",
-        "but", "and", "or", "if", "while", "about", "up", "that",
-        "this", "these", "those", "it", "its", "i", "me", "my", "we",
-        "our", "you", "your", "he", "him", "his", "she", "her", "they",
-        "them", "their", "what", "which", "who", "whom",
-    }
-    tokens = []
-    for word in text.lower().split():
-        clean = "".join(c for c in word if c.isalnum())
-        if clean and clean not in stop and len(clean) > 1:
-            tokens.append(clean)
-    return " ".join(tokens)
+    """Extract keywords as space-separated string. Uses shared tokenizer."""
+    return " ".join(_tokenize(text))
 
 def _scale(value: float, lo: float, hi: float) -> float:
     """Scale a 0-1 value to a [lo, hi] range."""
@@ -773,3 +781,135 @@ def _average_emotional_tags(tags: list[dict]) -> dict:
         if vals:
             result[k] = sum(vals) / len(vals)
     return result
+
+
+# ── TF-IDF cosine similarity (pure Python, zero deps) ──────────────
+
+def _tokenize(text: str) -> list[str]:
+    """Tokenize text into meaningful terms. Shared by keywords + TF-IDF."""
+    stop = {
+        "the", "a", "an", "is", "was", "were", "are", "be", "been",
+        "being", "have", "has", "had", "do", "does", "did", "will",
+        "would", "could", "should", "may", "might", "shall", "can",
+        "to", "of", "in", "for", "on", "with", "at", "by", "from",
+        "as", "into", "through", "during", "before", "after", "above",
+        "below", "between", "out", "off", "over", "under", "again",
+        "further", "then", "once", "here", "there", "when", "where",
+        "why", "how", "all", "each", "every", "both", "few", "more",
+        "most", "other", "some", "such", "no", "nor", "not", "only",
+        "own", "same", "so", "than", "too", "very", "just", "because",
+        "but", "and", "or", "if", "while", "about", "up", "that",
+        "this", "these", "those", "it", "its", "i", "me", "my", "we",
+        "our", "you", "your", "he", "him", "his", "she", "her", "they",
+        "them", "their", "what", "which", "who", "whom",
+    }
+    tokens = []
+    for word in text.lower().split():
+        clean = "".join(c for c in word if c.isalnum())
+        if clean and clean not in stop and len(clean) > 1:
+            tokens.append(clean)
+    return tokens
+
+
+def _tf(tokens: list[str]) -> dict[str, float]:
+    """Term frequency: count / total tokens."""
+    if not tokens:
+        return {}
+    counts: dict[str, int] = {}
+    for t in tokens:
+        counts[t] = counts.get(t, 0) + 1
+    n = len(tokens)
+    return {t: c / n for t, c in counts.items()}
+
+
+def _cosine(a: dict[str, float], b: dict[str, float]) -> float:
+    """Cosine similarity between two sparse vectors (dicts)."""
+    if not a or not b:
+        return 0.0
+    # dot product over shared keys
+    dot = sum(a[k] * b[k] for k in a if k in b)
+    if dot == 0.0:
+        return 0.0
+    mag_a = math.sqrt(sum(v * v for v in a.values()))
+    mag_b = math.sqrt(sum(v * v for v in b.values()))
+    if mag_a == 0.0 or mag_b == 0.0:
+        return 0.0
+    return dot / (mag_a * mag_b)
+
+
+class _TfIdf:
+    """Lightweight TF-IDF engine over a corpus of texts.
+
+    Rebuilds on each call to `build()`. Designed for <10k documents.
+    Pure Python, zero dependencies.
+    """
+
+    def __init__(self):
+        self._idf: dict[str, float] = {}
+        self._vectors: dict[str, dict[str, float]] = {}  # doc_id → tfidf vec
+
+    def build(self, docs: dict[str, str]):
+        """Build TF-IDF vectors from {doc_id: text} mapping."""
+        n = len(docs)
+        if n == 0:
+            self._idf = {}
+            self._vectors = {}
+            return
+
+        # tokenize all docs
+        tokenized: dict[str, list[str]] = {}
+        df: dict[str, int] = {}  # document frequency
+
+        for doc_id, text in docs.items():
+            tokens = _tokenize(text)
+            tokenized[doc_id] = tokens
+            seen: set[str] = set()
+            for t in tokens:
+                if t not in seen:
+                    df[t] = df.get(t, 0) + 1
+                    seen.add(t)
+
+        # IDF: log(N / df) — standard formula
+        self._idf = {
+            term: math.log((n + 1) / (freq + 1)) + 1.0
+            for term, freq in df.items()
+        }
+
+        # TF-IDF vectors
+        self._vectors = {}
+        for doc_id, tokens in tokenized.items():
+            tf = _tf(tokens)
+            self._vectors[doc_id] = {
+                t: tf_val * self._idf.get(t, 1.0)
+                for t, tf_val in tf.items()
+            }
+
+    def query_vector(self, text: str) -> dict[str, float]:
+        """Compute TF-IDF vector for a query string."""
+        tokens = _tokenize(text)
+        tf = _tf(tokens)
+        return {
+            t: tf_val * self._idf.get(t, 1.0)
+            for t, tf_val in tf.items()
+        }
+
+    def similarity(self, query_text: str, doc_id: str) -> float:
+        """Cosine similarity between a query and a stored document."""
+        qvec = self.query_vector(query_text)
+        dvec = self._vectors.get(doc_id, {})
+        return _cosine(qvec, dvec)
+
+    def similar_to_doc(self, doc_id: str, k: int = 5) -> list[tuple[str, float]]:
+        """Find k most similar docs to a given doc. Returns [(doc_id, score)]."""
+        dvec = self._vectors.get(doc_id)
+        if not dvec:
+            return []
+        scored = []
+        for other_id, other_vec in self._vectors.items():
+            if other_id == doc_id:
+                continue
+            sim = _cosine(dvec, other_vec)
+            if sim > 0.0:
+                scored.append((other_id, sim))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:k]
