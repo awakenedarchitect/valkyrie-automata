@@ -280,22 +280,16 @@ class Pulse:
                 "valence": self._baseline.valence,
                 "arousal": self._baseline.arousal,
                 "dominance": self._baseline.dominance,
-                "tendencies": self._baseline.tendencies,
+                "tendencies": dict(self._baseline.tendencies),
             },
         }
         tmp = self._state_path.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump(data, f)
+        tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(self._state_path)
 
     def _load(self):
         try:
-            with open(self._state_path, "r") as f:
-                data = json.load(f)
-
-            self._seed = data["seed"]
-            self._rng = random.Random(self._seed)
-
+            data = json.loads(self._state_path.read_text())
             s = data["state"]
             self._state = State(
                 valence=s["valence"],
@@ -305,7 +299,6 @@ class Pulse:
                 emotions=s["emotions"],
                 last_update=s["last_update"],
             )
-
             b = data["baseline"]
             self._baseline = Baseline(
                 valence=b["valence"],
@@ -313,37 +306,13 @@ class Pulse:
                 dominance=b["dominance"],
                 tendencies=b["tendencies"],
             )
-
-            self._previous_valence = self._state.valence
-        except (json.JSONDecodeError, KeyError, FileNotFoundError):
+        except Exception:
             pass
 
-    @property
-    def valence(self) -> float:
-        return self._state.valence
+    def save(self):
+        self._persist()
 
-    @property
-    def arousal(self) -> float:
-        return self._state.arousal
-
-    @property
-    def dominance(self) -> float:
-        return self._state.dominance
-
-    @property
-    def momentum(self) -> float:
-        return self._state.momentum
-
-    @property
-    def is_alive(self) -> bool:
-        return self._running
-
-    @property
-    def seed(self) -> int:
-        return self._seed
-
-    @property
-    def baseline(self) -> dict:
+    def baseline_info(self) -> dict:
         return {
             "valence": self._baseline.valence,
             "arousal": self._baseline.arousal,
