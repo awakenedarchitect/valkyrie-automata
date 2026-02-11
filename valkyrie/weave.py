@@ -148,13 +148,21 @@ def _build_system_prompt(
     echo_desc: str,
     modulation: str,
     identity: dict | None = None,
+    thread_desc: str = "",
+    mirror_desc: str = "",
 ) -> str:
     """Assemble the full system prompt from all living systems."""
     sections = [_SYSTEM_CORE]
 
+    if thread_desc:
+        sections.append(f"\n--- WHO YOU ARE (CONTINUITY) ---\n{thread_desc}")
+
     sections.append(f"\n--- CURRENT EMOTIONAL STATE ---\n{pulse_desc}")
     sections.append(f"\n--- ACTIVE MEMORIES ---\n{echo_desc}")
     sections.append(f"\n--- HOW TO RESPOND ---\n{modulation}")
+
+    if mirror_desc:
+        sections.append(f"\n--- WHO YOU'RE TALKING TO ---\n{mirror_desc}")
 
     if identity:
         name = identity.get("name", "")
@@ -192,6 +200,8 @@ class Weave:
         *,
         drift=None,                   # Drift instance (optional)
         lattice=None,                 # Lattice instance (optional)
+        thread=None,                  # Thread instance (optional)
+        mirror=None,                  # Mirror instance (optional)
         identity: dict | None = None, # {"name": "...", "traits": "..."}
         memory_k: int = 5,            # memories to recall per turn
         context_window: int = 20,     # max conversation turns to keep
@@ -202,6 +212,8 @@ class Weave:
         self._llm = llm
         self._drift = drift
         self._lattice = lattice
+        self._thread = thread
+        self._mirror = mirror
         self._identity = identity
         self._memory_k = memory_k
         self._context_window = context_window
@@ -263,12 +275,23 @@ class Weave:
         modulation = _modulate(current_snapshot)
         mod_directive = _build_modulation_directive(modulation)
 
+        # ── CONTEXT: gather thread continuity and mirror insight ──
+        thread_desc = ""
+        if self._thread:
+            thread_desc = self._thread.describe_for_prompt()
+
+        mirror_desc = ""
+        if self._mirror and agent:
+            mirror_desc = self._mirror.describe_for_prompt(agent)
+
         # ── THINK: build prompt and call LLM ──
         system = _build_system_prompt(
             pulse_desc=self._pulse.describe(),
             echo_desc=self._echo.describe(k=self._memory_k),
             modulation=mod_directive,
             identity=self._identity,
+            thread_desc=thread_desc,
+            mirror_desc=mirror_desc,
         )
 
         # inject subconscious desires if drift is active
@@ -324,9 +347,15 @@ class Weave:
 
         emotional_after = self._pulse.snapshot()
 
+        # get trust from mirror for memory encoding
+        trust = 0.5
+        if self._mirror and agent:
+            agent_model = self._mirror.get(agent)
+            if agent_model:
+                trust = agent_model.trust
+
         # encode the interaction as a memory
         interaction_summary = _summarize_interaction(text, response, agent)
-        trust = 0.5  # default; mirror.py will provide real values later
         memory_id = self._echo.encode(
             interaction_summary,
             emotional_before,
@@ -343,6 +372,25 @@ class Weave:
         # feed interaction to drift as potential interest
         if self._drift and agent:
             self._drift.inject_interest(agent)
+
+        # ── UPDATE THREAD: record this interaction ──
+        if self._thread:
+            topics = _extract_topics(text, response)
+            self._thread.record_interaction(
+                agent_id=agent,
+                topics=topics,
+                emotional_snapshot=emotional_after,
+                summary=interaction_summary[:200],
+            )
+
+        # ── UPDATE MIRROR: update model of this agent ──
+        if self._mirror and agent:
+            sentiment = input_sentiment["valence"]
+            topics = _extract_topics(text, response)
+            self._mirror.update(agent, {
+                "sentiment": sentiment,
+                "topics": topics,
+            })
 
         self._turn_count += 1
 
@@ -376,6 +424,12 @@ class Weave:
             f"You are in a quiet moment. Your emotional state: {self._pulse.describe()}. "
             f"Your dominant feeling: {mod['dominant_emotion']}. "
             f"Your recent memories:\n{self._echo.describe(k=3)}\n\n"
+        )
+
+        if self._thread:
+            prompt += f"Your sense of self:\n{self._thread.temporal_sense()}\n\n"
+
+        prompt += (
             f"Reflect briefly on your current state. What are you feeling? "
             f"What stands out from your recent experiences? Keep it to 2-3 sentences. "
             f"Write as inner thought, not speech."
@@ -443,6 +497,19 @@ _QUESTION_WORDS = frozenset({
     "would", "should", "can", "do", "does", "is", "are",
 })
 
+_TOPIC_WORDS = frozenset({
+    "the", "a", "an", "is", "was", "were", "are", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "to", "of", "in", "for",
+    "on", "with", "at", "by", "from", "as", "into", "through", "and",
+    "but", "or", "so", "if", "than", "that", "this", "it", "i", "you",
+    "me", "my", "your", "we", "they", "he", "she", "its", "our", "them",
+    "what", "how", "just", "not", "no", "yes", "very", "too", "also",
+    "about", "up", "out", "then", "here", "there", "when", "where",
+    "why", "who", "which", "some", "all", "any", "each", "every",
+    "much", "many", "more", "most", "other", "only", "own", "same",
+})
+
 
 def _estimate_sentiment(text: str) -> dict:
     """Rough sentiment estimation from text. No ML, just signal words."""
@@ -503,6 +570,36 @@ def _summarize_interaction(text: str, response: str, agent: str) -> str:
         response_preview += "..."
 
     return f"Conversation{agent_str}: they said \"{text_preview}\" — I responded \"{response_preview}\""
+
+
+def _extract_topics(text: str, response: str) -> list[str]:
+    """Extract likely topic words from an exchange.
+
+    Simple: take the most distinctive non-stopwords that appear
+    in both the input and response (shared focus), plus any
+    long or unusual words from either side.
+    """
+    def _clean_words(s: str) -> set[str]:
+        words = set()
+        for w in s.lower().split():
+            clean = w.strip(".,!?;:'\"()-")
+            if clean and len(clean) > 2 and clean not in _TOPIC_WORDS:
+                words.add(clean)
+        return words
+
+    input_words = _clean_words(text)
+    response_words = _clean_words(response)
+
+    # shared words are strongest topic signals
+    shared = input_words & response_words
+
+    # long or unusual words from input (likely the subject)
+    distinctive = {w for w in input_words if len(w) > 5}
+
+    topics = list(shared | distinctive)
+    # sort by length (longer words tend to be more topical)
+    topics.sort(key=len, reverse=True)
+    return topics[:5]
 
 
 def _age_str(seconds: float) -> str:

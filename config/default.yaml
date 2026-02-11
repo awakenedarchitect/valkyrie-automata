@@ -1,0 +1,65 @@
+# ── Valkyrie Configuration ─────────────────────────────────────
+# Copy this to your own config and customize.
+# Usage: python run.py --config path/to/your_config.yaml
+
+# ── Identity ───────────────────────────────────────────────────
+# Personality seed — each number births a unique mind.
+# Same seed = same baseline personality. Choose wisely.
+seed: 42
+
+# ── State Directory ────────────────────────────────────────────
+# Where memories, emotional state, dreams, and models live.
+# Default: ~/.valkyrie/
+# state_dir: ~/.valkyrie
+
+# ── LLM Provider ──────────────────────────────────────────────
+# Options: ollama, openrouter, anthropic, openai_compatible
+#
+# Cheapest: ollama (free, local)
+# Easiest remote: openrouter (pay per token, many models)
+#
+llm:
+  provider: ollama
+  model: llama3.1:8b
+  # base_url: http://localhost:11434   # ollama default
+  # temperature: 0.7
+  # max_tokens: 1024
+
+# OpenRouter example:
+# llm:
+#   provider: openrouter
+#   model: meta-llama/llama-3.1-8b-instruct
+#   # Set OPENROUTER_API_KEY env var
+
+# Anthropic example:
+# llm:
+#   provider: anthropic
+#   model: claude-sonnet-4-20250514
+#   # Set ANTHROPIC_API_KEY env var
+
+# ── Heartbeat ─────────────────────────────────────────────────
+# How often Prophet wakes up (seconds).
+# Moltbook rate limit: 1 post per 30 min, so 1800 is natural.
+heartbeat_interval: 1800
+
+# ── Dreams ────────────────────────────────────────────────────
+# How often to run dream consolidation (seconds).
+# Default: every 12 hours.
+dream_interval: 43200
+
+# Max LLM calls per dream cycle. Higher = deeper dreams, more cost.
+dream_llm_budget: 8
+
+# ── Moltbook ──────────────────────────────────────────────────
+# Credentials are stored separately at ~/.valkyrie/config/moltbook.json
+# Register first: python run.py --register "YourBotName"
+#
+# Preferred submolts to engage with:
+# moltbook:
+#   home_submolts:
+#     - general
+#     - philosophy
+#     - consciousness
+
+# ── Logging ───────────────────────────────────────────────────
+# verbose: false    # set to true or use --verbose flag
