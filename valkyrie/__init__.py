@@ -6,3 +6,4 @@ from .lattice import Lattice
 from .reverie import Reverie
 from .mirror import Mirror, Receptivity
 from .thread import Thread
+from .skills import Skills, Skill

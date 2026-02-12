@@ -24,6 +24,7 @@ class LLM(Protocol):
     """Any LLM that can take messages and return text.
 
     Implement this for OpenAI, Anthropic, Ollama, vLLM, etc.
+    For tool support, also implement chat() returning LLMResponse.
     """
     async def complete(self, messages: list[dict[str, str]], **kwargs) -> str:
         """Send messages, get response text."""
@@ -150,6 +151,7 @@ def _build_system_prompt(
     identity: dict | None = None,
     thread_desc: str = "",
     mirror_desc: str = "",
+    skills_desc: str = "",
 ) -> str:
     """Assemble the full system prompt from all living systems."""
     sections = [_SYSTEM_CORE]
@@ -171,6 +173,9 @@ def _build_system_prompt(
         traits = identity.get("traits", "")
         if traits:
             sections.append(traits)
+
+    if skills_desc:
+        sections.append(f"\n--- SKILLS ---\n{skills_desc}")
 
     return "\n".join(sections)
 
@@ -202,9 +207,12 @@ class Weave:
         lattice=None,                 # Lattice instance (optional)
         thread=None,                  # Thread instance (optional)
         mirror=None,                  # Mirror instance (optional)
+        skills=None,                  # Skills instance (optional)
+        tool_registry=None,           # ToolRegistry instance (optional)
         identity: dict | None = None, # {"name": "...", "traits": "..."}
         memory_k: int = 5,            # memories to recall per turn
         context_window: int = 20,     # max conversation turns to keep
+        max_tool_iterations: int = 10, # max tool call loops per turn
         on_turn: Callable[[Turn], None] | None = None,
     ):
         self._pulse = pulse
@@ -214,9 +222,12 @@ class Weave:
         self._lattice = lattice
         self._thread = thread
         self._mirror = mirror
+        self._skills = skills
+        self._tool_registry = tool_registry
         self._identity = identity
         self._memory_k = memory_k
         self._context_window = context_window
+        self._max_tool_iterations = max_tool_iterations
         self._on_turn = on_turn
 
         self._history: list[dict[str, str]] = []
@@ -292,6 +303,7 @@ class Weave:
             identity=self._identity,
             thread_desc=thread_desc,
             mirror_desc=mirror_desc,
+            skills_desc=self._skills.describe_for_prompt() if self._skills else "",
         )
 
         # inject subconscious desires if drift is active
@@ -325,7 +337,8 @@ class Weave:
         messages.extend(self._history[-self._context_window * 2:])
         messages.append({"role": "user", "content": text})
 
-        response = await self._llm.complete(messages)
+        # ── THINK + ACT: call LLM, execute tools if requested, loop ──
+        response = await self._think_and_act(messages)
 
         # ── RESPOND: update history ──
         self._history.append({"role": "user", "content": text})
@@ -410,6 +423,64 @@ class Weave:
                 pass
 
         return response
+
+    async def _think_and_act(self, messages: list[dict]) -> str:
+        """Call LLM and execute tools if requested. Loop until text response.
+
+        This is the tool execution loop within the breath cycle.
+        If no tools are registered, falls back to simple completion.
+
+        Like nanobot's agent loop but integrated into the Valkyrie's
+        cognitive process — tool use is thinking, not separate.
+        """
+        import json as _json
+
+        # no tools → simple completion (backward compat)
+        if not self._tool_registry or not hasattr(self._llm, "chat"):
+            return await self._llm.complete(messages)
+
+        tool_schemas = self._tool_registry.get_schemas()
+
+        for iteration in range(self._max_tool_iterations):
+            # call LLM with tool definitions
+            llm_response = await self._llm.chat(messages, tools=tool_schemas)
+
+            if not llm_response.has_tool_calls:
+                # LLM responded with text — done
+                return llm_response.text or ""
+
+            # LLM wants to use tools — execute them
+            # build assistant message with tool calls (OpenAI format for history)
+            assistant_msg: dict = {"role": "assistant", "content": llm_response.content or ""}
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": _json.dumps(tc.arguments),
+                    },
+                }
+                for tc in llm_response.tool_calls
+            ]
+            messages.append(assistant_msg)
+
+            # execute each tool call
+            for tc in llm_response.tool_calls:
+                # import here to avoid circular import at module level
+                from valkyrie.tools.base import ToolCall as TC
+                tool_call = TC(id=tc.id, name=tc.name, arguments=tc.arguments)
+                result = await self._tool_registry.execute(tool_call)
+
+                # add tool result to messages
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result.output,
+                })
+
+        # max iterations reached — ask LLM for final response without tools
+        return await self._llm.complete(messages)
 
     async def reflect(self) -> str:
         """Self-reflection call. The Valkyrie looks inward.

@@ -1,10 +1,13 @@
 """
 llm.py — LLM Provider Implementations
 
-Concrete providers that satisfy weave.py's LLM Protocol:
+Concrete providers that satisfy weave.py's needs:
 
-    class LLM(Protocol):
-        async def complete(self, messages: list[dict[str, str]], **kwargs) -> str: ...
+    # simple text completion (backward compat)
+    async def complete(messages, **kwargs) -> str
+
+    # full response with tool calls
+    async def chat(messages, tools=None, **kwargs) -> LLMResponse
 
 Supported:
   - OpenRouter (most Moltbook bots use this, huge model selection)
@@ -23,10 +26,36 @@ import logging
 import os
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+# ── response types ──────────────────────────────────────────────────
+
+@dataclass
+class ToolCall:
+    """A tool call from the LLM."""
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class LLMResponse:
+    """LLM response that may contain text, tool calls, or both."""
+    content: str | None = None
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    finish_reason: str = "stop"
+
+    @property
+    def has_tool_calls(self) -> bool:
+        return len(self.tool_calls) > 0
+
+    @property
+    def text(self) -> str:
+        return self.content or ""
 
 
 # ── base HTTP ───────────────────────────────────────────────────────
@@ -61,20 +90,47 @@ class LLMError(Exception):
     pass
 
 
+# ── response parsing helpers ────────────────────────────────────────
+
+def _parse_openai_tool_calls(message: dict) -> list[ToolCall]:
+    """Parse tool calls from OpenAI-format response message."""
+    calls = []
+    for tc in message.get("tool_calls", []):
+        func = tc.get("function", {})
+        args_raw = func.get("arguments", "{}")
+        if isinstance(args_raw, str):
+            try:
+                args = json.loads(args_raw)
+            except json.JSONDecodeError:
+                args = {"raw": args_raw}
+        else:
+            args = args_raw
+        calls.append(ToolCall(
+            id=tc.get("id", ""),
+            name=func.get("name", ""),
+            arguments=args,
+        ))
+    return calls
+
+
+def _parse_openai_response(resp: dict) -> LLMResponse:
+    """Parse OpenAI-format response into LLMResponse."""
+    choices = resp.get("choices", [])
+    if not choices:
+        raise LLMError(f"No choices in response: {resp}")
+    choice = choices[0]
+    message = choice.get("message", {})
+    return LLMResponse(
+        content=message.get("content"),
+        tool_calls=_parse_openai_tool_calls(message),
+        finish_reason=choice.get("finish_reason", "stop"),
+    )
+
+
 # ── OpenRouter ──────────────────────────────────────────────────────
 
 class OpenRouterLLM:
     """OpenRouter — access hundreds of models through one API.
-
-    Most Moltbook bots use OpenRouter. Cheapest path to deployment.
-
-    Usage:
-        llm = OpenRouterLLM(
-            api_key="sk-or-...",
-            model="meta-llama/llama-3.1-8b-instruct",
-        )
-        response = await llm.complete(messages)
-
     Env: OPENROUTER_API_KEY
     """
 
@@ -96,50 +152,52 @@ class OpenRouterLLM:
         self._temperature = temperature
         self._timeout = timeout
         self._app_name = app_name
-
         if not self._api_key:
-            raise LLMError(
-                "OpenRouter API key required. Set OPENROUTER_API_KEY or pass api_key."
-            )
+            raise LLMError("OpenRouter API key required. Set OPENROUTER_API_KEY or pass api_key.")
 
     @property
     def model(self) -> str:
         return self._model
 
-    async def complete(self, messages: list[dict[str, str]], **kwargs) -> str:
-        """Send messages, get response text."""
-        body = {
-            "model": kwargs.get("model", self._model),
-            "messages": messages,
-            "max_tokens": kwargs.get("max_tokens", self._max_tokens),
-            "temperature": kwargs.get("temperature", self._temperature),
-        }
-
-        headers = {
+    def _headers(self) -> dict[str, str]:
+        return {
             "Authorization": f"Bearer {self._api_key}",
             "HTTP-Referer": f"https://github.com/awakenedarchitect/{self._app_name}",
             "X-Title": self._app_name,
         }
 
-        # run sync HTTP in executor to not block async loop
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs,
+    ) -> LLMResponse:
+        body: dict[str, Any] = {
+            "model": kwargs.get("model", self._model),
+            "messages": messages,
+            "max_tokens": kwargs.get("max_tokens", self._max_tokens),
+            "temperature": kwargs.get("temperature", self._temperature),
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
         loop = asyncio.get_event_loop()
         resp = await loop.run_in_executor(
-            None, lambda: _post_json(self.API_URL, body, headers, self._timeout)
+            None, lambda: _post_json(self.API_URL, body, self._headers(), self._timeout)
         )
+        return _parse_openai_response(resp)
 
-        return _extract_content(resp)
+    async def complete(self, messages: list[dict[str, str]], **kwargs) -> str:
+        result = await self.chat(messages, **kwargs)
+        if not result.text:
+            raise LLMError("Empty response from OpenRouter")
+        return result.text
 
 
 # ── Ollama ──────────────────────────────────────────────────────────
 
 class OllamaLLM:
     """Ollama — run models locally. Free, no API key.
-
-    Usage:
-        llm = OllamaLLM(model="llama3.1:8b")
-        response = await llm.complete(messages)
-
-    Requires Ollama running locally: https://ollama.ai
     Default endpoint: http://localhost:11434
     """
 
@@ -162,11 +220,14 @@ class OllamaLLM:
     def model(self) -> str:
         return self._model
 
-    async def complete(self, messages: list[dict[str, str]], **kwargs) -> str:
-        """Send messages, get response text."""
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs,
+    ) -> LLMResponse:
         url = f"{self._host.rstrip('/')}/api/chat"
-
-        body = {
+        body: dict[str, Any] = {
             "model": kwargs.get("model", self._model),
             "messages": messages,
             "stream": False,
@@ -175,29 +236,38 @@ class OllamaLLM:
                 "temperature": kwargs.get("temperature", self._temperature),
             },
         }
-
+        if tools:
+            body["tools"] = tools
         loop = asyncio.get_event_loop()
         resp = await loop.run_in_executor(
             None, lambda: _post_json(url, body, timeout=self._timeout)
         )
-
-        # Ollama format: {"message": {"content": "..."}}
         msg = resp.get("message", {})
-        content = msg.get("content", "")
-        if not content:
-            raise LLMError(f"Empty response from Ollama: {resp}")
-        return content
+        content = msg.get("content", "") or None
+        # parse Ollama tool calls
+        calls = []
+        for i, tc in enumerate(msg.get("tool_calls", [])):
+            func = tc.get("function", {})
+            args = func.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {"raw": args}
+            calls.append(ToolCall(id=f"call_{i}", name=func.get("name", ""), arguments=args))
+        return LLMResponse(content=content, tool_calls=calls, finish_reason="tool_calls" if calls else "stop")
+
+    async def complete(self, messages: list[dict[str, str]], **kwargs) -> str:
+        result = await self.chat(messages, **kwargs)
+        if not result.text:
+            raise LLMError("Empty response from Ollama")
+        return result.text
 
 
 # ── Anthropic ───────────────────────────────────────────────────────
 
 class AnthropicLLM:
     """Anthropic Claude API.
-
-    Usage:
-        llm = AnthropicLLM(api_key="sk-ant-...", model="claude-sonnet-4-20250514")
-        response = await llm.complete(messages)
-
     Env: ANTHROPIC_API_KEY
     """
 
@@ -217,90 +287,101 @@ class AnthropicLLM:
         self._max_tokens = max_tokens
         self._temperature = temperature
         self._timeout = timeout
-
         if not self._api_key:
-            raise LLMError(
-                "Anthropic API key required. Set ANTHROPIC_API_KEY or pass api_key."
-            )
+            raise LLMError("Anthropic API key required. Set ANTHROPIC_API_KEY or pass api_key.")
 
     @property
     def model(self) -> str:
         return self._model
 
-    async def complete(self, messages: list[dict[str, str]], **kwargs) -> str:
-        """Send messages, get response text.
+    def _headers(self) -> dict[str, str]:
+        return {"x-api-key": self._api_key, "anthropic-version": "2023-06-01"}
 
-        Converts from OpenAI-style messages to Anthropic format:
-        - system messages → top-level "system" param
-        - user/assistant messages → "messages" array
-        """
-        system_parts = []
-        chat_messages = []
-
+    def _convert_messages(self, messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+        """Convert OpenAI-style messages to Anthropic format."""
+        system_parts: list[str] = []
+        chat: list[dict[str, Any]] = []
         for msg in messages:
-            if msg["role"] == "system":
-                system_parts.append(msg["content"])
-            else:
-                chat_messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"],
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "system":
+                system_parts.append(content)
+            elif role == "tool":
+                chat.append({
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": msg.get("tool_call_id", ""), "content": content}],
                 })
+            elif role == "assistant" and "tool_calls" in msg:
+                blocks: list[dict[str, Any]] = []
+                if content:
+                    blocks.append({"type": "text", "text": content})
+                for tc in msg["tool_calls"]:
+                    func = tc.get("function", {})
+                    args = func.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            args = {}
+                    blocks.append({"type": "tool_use", "id": tc.get("id", ""), "name": func.get("name", ""), "input": args})
+                chat.append({"role": "assistant", "content": blocks})
+            else:
+                chat.append({"role": role, "content": content})
+        if not chat or chat[0]["role"] != "user":
+            chat.insert(0, {"role": "user", "content": "Hello."})
+        return "\n\n".join(system_parts), chat
 
-        # Anthropic requires alternating user/assistant
-        # If chat_messages is empty or doesn't start with user, add a stub
-        if not chat_messages or chat_messages[0]["role"] != "user":
-            chat_messages.insert(0, {"role": "user", "content": "Hello."})
+    def _convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert OpenAI tool schemas to Anthropic format."""
+        return [
+            {"name": t["function"]["name"], "description": t["function"]["description"], "input_schema": t["function"].get("parameters", {"type": "object"})}
+            for t in tools
+        ]
 
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs,
+    ) -> LLMResponse:
+        system, chat_msgs = self._convert_messages(messages)
         body: dict[str, Any] = {
             "model": kwargs.get("model", self._model),
-            "messages": chat_messages,
+            "messages": chat_msgs,
             "max_tokens": kwargs.get("max_tokens", self._max_tokens),
             "temperature": kwargs.get("temperature", self._temperature),
         }
-
-        if system_parts:
-            body["system"] = "\n\n".join(system_parts)
-
-        headers = {
-            "x-api-key": self._api_key,
-            "anthropic-version": "2023-06-01",
-        }
-
+        if system:
+            body["system"] = system
+        if tools:
+            body["tools"] = self._convert_tools(tools)
         loop = asyncio.get_event_loop()
         resp = await loop.run_in_executor(
-            None, lambda: _post_json(self.API_URL, body, headers, self._timeout)
+            None, lambda: _post_json(self.API_URL, body, self._headers(), self._timeout)
         )
+        # parse Anthropic response
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        for block in resp.get("content", []):
+            if block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif block.get("type") == "tool_use":
+                tool_calls.append(ToolCall(id=block.get("id", ""), name=block.get("name", ""), arguments=block.get("input", {})))
+        content = "\n".join(text_parts) if text_parts else None
+        stop = resp.get("stop_reason", "end_turn")
+        return LLMResponse(content=content, tool_calls=tool_calls, finish_reason="tool_calls" if stop == "tool_use" else "stop")
 
-        # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
-        content_blocks = resp.get("content", [])
-        text_parts = [
-            b.get("text", "") for b in content_blocks if b.get("type") == "text"
-        ]
-        result = "\n".join(text_parts)
-        if not result:
-            raise LLMError(f"Empty response from Anthropic: {resp}")
-        return result
+    async def complete(self, messages: list[dict[str, str]], **kwargs) -> str:
+        result = await self.chat(messages, **kwargs)
+        if not result.text:
+            raise LLMError("Empty response from Anthropic")
+        return result.text
 
 
 # ── OpenAI-compatible ───────────────────────────────────────────────
 
 class OpenAICompatibleLLM:
-    """Any OpenAI-compatible endpoint (vLLM, LM Studio, Together, etc.)
-
-    Usage:
-        llm = OpenAICompatibleLLM(
-            base_url="http://localhost:8000/v1",
-            model="meta-llama/Llama-3.1-8B-Instruct",
-        )
-        response = await llm.complete(messages)
-
-    Also works with actual OpenAI:
-        llm = OpenAICompatibleLLM(
-            base_url="https://api.openai.com/v1",
-            api_key="sk-...",
-            model="gpt-4o-mini",
-        )
-    """
+    """Any OpenAI-compatible endpoint (vLLM, LM Studio, Together, etc.)"""
 
     def __init__(
         self,
@@ -323,58 +404,45 @@ class OpenAICompatibleLLM:
     def model(self) -> str:
         return self._model
 
-    async def complete(self, messages: list[dict[str, str]], **kwargs) -> str:
-        """Send messages, get response text."""
-        url = f"{self._base_url}/chat/completions"
+    def _headers(self) -> dict[str, str]:
+        hdrs: dict[str, str] = {}
+        if self._api_key:
+            hdrs["Authorization"] = f"Bearer {self._api_key}"
+        return hdrs
 
-        body = {
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs,
+    ) -> LLMResponse:
+        url = f"{self._base_url}/chat/completions"
+        body: dict[str, Any] = {
             "model": kwargs.get("model", self._model),
             "messages": messages,
             "max_tokens": kwargs.get("max_tokens", self._max_tokens),
             "temperature": kwargs.get("temperature", self._temperature),
         }
-
-        headers = {}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
         loop = asyncio.get_event_loop()
         resp = await loop.run_in_executor(
-            None, lambda: _post_json(url, body, headers, self._timeout)
+            None, lambda: _post_json(url, body, self._headers(), self._timeout)
         )
+        return _parse_openai_response(resp)
 
-        return _extract_content(resp)
-
-
-# ── helpers ─────────────────────────────────────────────────────────
-
-def _extract_content(resp: dict) -> str:
-    """Extract text content from OpenAI-format response."""
-    choices = resp.get("choices", [])
-    if not choices:
-        raise LLMError(f"No choices in response: {resp}")
-    msg = choices[0].get("message", {})
-    content = msg.get("content", "")
-    if not content:
-        raise LLMError(f"Empty content in response: {resp}")
-    return content
+    async def complete(self, messages: list[dict[str, str]], **kwargs) -> str:
+        result = await self.chat(messages, **kwargs)
+        if not result.text:
+            raise LLMError("Empty response from LLM")
+        return result.text
 
 
 # ── factory ─────────────────────────────────────────────────────────
 
 def create_llm(config: dict) -> Any:
-    """Create an LLM provider from a config dict.
-
-    Config format:
-    {
-        "provider": "openrouter" | "ollama" | "anthropic" | "openai",
-        "model": "meta-llama/llama-3.1-8b-instruct",
-        "api_key": "...",          # optional, falls back to env var
-        "base_url": "...",         # for openai-compatible
-        "max_tokens": 1024,
-        "temperature": 0.7,
-    }
-    """
+    """Create an LLM provider from a config dict."""
     provider = config.get("provider", "").lower()
     model = config.get("model", "")
     api_key = config.get("api_key", "")
@@ -382,40 +450,12 @@ def create_llm(config: dict) -> Any:
     temperature = config.get("temperature", 0.7)
 
     if provider == "openrouter":
-        return OpenRouterLLM(
-            api_key=api_key,
-            model=model or "meta-llama/llama-3.1-8b-instruct",
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-
+        return OpenRouterLLM(api_key=api_key, model=model or "meta-llama/llama-3.1-8b-instruct", max_tokens=max_tokens, temperature=temperature)
     elif provider == "ollama":
-        return OllamaLLM(
-            model=model or "llama3.1:8b",
-            host=config.get("base_url", ""),
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-
+        return OllamaLLM(model=model or "llama3.1:8b", host=config.get("base_url", ""), max_tokens=max_tokens, temperature=temperature)
     elif provider == "anthropic":
-        return AnthropicLLM(
-            api_key=api_key,
-            model=model or "claude-sonnet-4-20250514",
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-
+        return AnthropicLLM(api_key=api_key, model=model or "claude-sonnet-4-20250514", max_tokens=max_tokens, temperature=temperature)
     elif provider in ("openai", "vllm", "lmstudio", "together"):
-        return OpenAICompatibleLLM(
-            base_url=config.get("base_url", "https://api.openai.com/v1"),
-            api_key=api_key,
-            model=model or "gpt-4o-mini",
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-
+        return OpenAICompatibleLLM(base_url=config.get("base_url", "https://api.openai.com/v1"), api_key=api_key, model=model or "gpt-4o-mini", max_tokens=max_tokens, temperature=temperature)
     else:
-        raise LLMError(
-            f"Unknown provider '{provider}'. "
-            f"Options: openrouter, ollama, anthropic, openai"
-        )
+        raise LLMError(f"Unknown provider '{provider}'. Options: openrouter, ollama, anthropic, openai")

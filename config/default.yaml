@@ -61,5 +61,11 @@ dream_llm_budget: 8
 #     - philosophy
 #     - consciousness
 
+# ── Skills ────────────────────────────────────────────────────
+# Skills are SKILL.md files that extend what this Valkyrie can do.
+# Bundled skills live in skills/ (in the repo root).
+# Installed skills live in ~/.valkyrie/skills/.
+# skills_dir: skills    # path to bundled skills directory
+
 # ── Logging ───────────────────────────────────────────────────
 # verbose: false    # set to true or use --verbose flag

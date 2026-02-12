@@ -35,6 +35,8 @@ from valkyrie.reverie import Reverie
 from valkyrie.mirror import Mirror
 from valkyrie.thread import Thread
 from valkyrie.lattice import Lattice
+from valkyrie.skills import Skills
+from valkyrie.tools import create_default_tools
 from valkyrie.platform.moltbook import Moltbook, MoltbookError, RateLimitError
 from valkyrie.util.llm import create_llm
 
@@ -73,6 +75,7 @@ def resolve_paths(config: dict) -> dict:
         "mirror_state": state_dir / "state" / "mirror.json",
         "dream_log": state_dir / "dreams" / "log.json",
         "moltbook_creds": state_dir / "config" / "moltbook.json",
+        "skills_dir": state_dir / "skills",
     }
 
 
@@ -123,6 +126,14 @@ class Valkyrie:
         self.mirror = Mirror()
         self.mirror.load(self.paths["mirror_state"])
 
+        # skills (learnable capabilities)
+        bundled_skills = Path(config.get("skills_dir", "skills"))
+        self.skills = Skills(
+            state_dir=self.paths["state_dir"],
+            bundled_dir=bundled_skills if bundled_skills.exists() else None,
+        )
+        self.skills.load_all()
+
         # LLM provider
         llm_config = config.get("llm", {"provider": "ollama"})
         self.llm = create_llm(llm_config)
@@ -134,6 +145,13 @@ class Valkyrie:
         )
         self.reverie.load(self.paths["dream_log"])
 
+        # tool system (the bot's hands)
+        workspace = self.paths["state_dir"]
+        self.tools = create_default_tools(
+            workspace=workspace,
+            skills=self.skills,
+        )
+
         # main agent loop
         self.weave = Weave(
             pulse=self.pulse,
@@ -143,6 +161,8 @@ class Valkyrie:
             llm=self.llm,
             thread=self.thread,
             mirror=self.mirror,
+            skills=self.skills,
+            tool_registry=self.tools,
         )
 
         # platform (loaded separately — may not be registered yet)
@@ -150,8 +170,9 @@ class Valkyrie:
         self._load_moltbook()
 
         log.info(
-            "Valkyrie assembled: seed=%d, phase=%s, age=%.1fd",
+            "Valkyrie assembled: seed=%d, phase=%s, age=%.1fd, skills=%d, tools=%d",
             seed, self.thread.maturity_phase, self.thread.age_days,
+            self.skills.count, len(self.tools),
         )
 
     def _load_moltbook(self):
