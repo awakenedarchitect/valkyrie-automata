@@ -28,31 +28,50 @@ log = logging.getLogger(__name__)
 
 
 # ── protocols for dependency injection ──────────────────────────────
+#
+# These match the ACTUAL method signatures in echo.py and drift.py.
+# If you change a module's API, update the protocol here too.
 
 @runtime_checkable
 class EchoLike(Protocol):
-    """What reverie needs from echo.py."""
-    def recall(self, query: str, k: int = 5) -> list: ...
-    def find_similar(self, memory_id: str, k: int = 5) -> list: ...
-    def merge(self, ids: list[str], merged_summary: str, **kw) -> Any: ...
+    """What reverie needs from echo.py.
+
+    Echo stores memories in SQLite. Public query methods return
+    list[dict] with keys: id, summary, importance, timestamp, etc.
+    find_similar returns list[tuple[str, float]] — (id, score) pairs.
+    """
+    def recall(self, query: str, *, k: int = 5, **kw) -> list[dict]: ...
+    def find_similar(self, memory_id: str, k: int = 5,
+                     min_score: float = 0.1) -> list[tuple[str, float]]: ...
+    def merge(self, memory_ids: list[str], new_summary: str,
+              emotional_snapshot: dict | None = None) -> str: ...
     def prune(self, threshold: float = 0.05) -> int: ...
-    def decay_all(self) -> None: ...
-    def connect(self, id_a: str, id_b: str) -> None: ...
-    def encode(self, summary: str, **kw) -> Any: ...
-    def all_memories(self, min_importance: float = 0.0) -> list: ...
+    def tick(self, dt: float = 1.0) -> None: ...
+    def connect(self, id_a: str, id_b: str, strength: float = 1.0) -> None: ...
+    def encode(self, summary: str, emotional_snapshot: dict | None = None,
+               *, source_agent: str = "", **kw) -> str: ...
+    def strongest(self, n: int = 10) -> list[dict]: ...
+    def recent(self, n: int = 10) -> list[dict]: ...
+    def get(self, memory_id: str) -> dict | None: ...
+    def strengthen(self, memory_id: str, boost: float = 0.1) -> None: ...
+    def count(self) -> int: ...
 
 
 @runtime_checkable
 class DriftLike(Protocol):
-    """What reverie needs from drift.py."""
-    def cycle(self, lowered_thresholds: bool = False) -> list: ...
+    """What reverie needs from drift.py.
+
+    drift.cycle() is async and takes an optional LLM.
+    """
+    async def cycle(self, llm: Any = None) -> list: ...
 
 
 @runtime_checkable
 class PulseLike(Protocol):
     """What reverie needs from pulse.py."""
     def snapshot(self) -> dict: ...
-    def stimulate(self, valence: float = 0, arousal: float = 0, dominance: float = 0) -> None: ...
+    def stimulate(self, valence: float = 0, arousal: float = 0,
+                  dominance: float = 0) -> None: ...
 
 
 @runtime_checkable
@@ -149,7 +168,8 @@ class Reverie:
         log.info("Dream cycle beginning...")
 
         # apply global decay first — time passes
-        self._echo.decay_all()
+        # echo uses tick() for decay, not decay_all()
+        self._echo.tick(dt=1.0)
 
         # budget LLM calls across phases (proportional to phase weight)
         budget = self._max_llm_calls
@@ -170,8 +190,8 @@ class Reverie:
         merged = await self._phase_compress(compress_budget)
         entry.memories_merged = merged
 
-        # phase 4 — explore
-        goals = self._phase_explore()
+        # phase 4 — explore (drift.cycle is async)
+        goals = await self._phase_explore()
         entry.goals_surfaced = goals
 
         # prune dead memories
@@ -202,7 +222,20 @@ class Reverie:
         Replaying strengthens memories and tests pattern robustness.
         With an LLM, generates "what if" variations.
         """
-        memories = self._echo.all_memories(min_importance=0.3)
+        # echo.strongest() and echo.recent() return list[dict]
+        # each dict has keys: id, summary, importance, timestamp, etc.
+        strongest = self._echo.strongest(n=budget * 2)
+        recent = self._echo.recent(n=budget)
+
+        # deduplicate by id
+        seen: set[str] = set()
+        memories: list[dict] = []
+        for m in strongest + recent:
+            mid = m.get("id", "")
+            if mid and mid not in seen:
+                seen.add(mid)
+                memories.append(m)
+
         if not memories:
             return 0
 
@@ -210,32 +243,37 @@ class Reverie:
         now = time.time()
         scored = []
         for m in memories:
-            ts = getattr(m, "timestamp", 0) or 0
-            imp = getattr(m, "importance", 0) or 0
+            ts = m.get("timestamp", 0)
+            imp = m.get("importance", 0)
             recency = max(0, 1.0 - (now - ts) / (7 * 86400))  # 7-day window
             scored.append((imp * 0.6 + recency * 0.4, m))
         scored.sort(key=lambda x: x[0], reverse=True)
 
         # replay top memories
         replayed = 0
-        for score, memory in scored[:budget * 2]:  # review more than budget
-            mid = getattr(memory, "id", None)
-            summary = getattr(memory, "summary", "")
+        for _score, memory in scored[:budget * 2]:  # review more than budget
+            mid = memory.get("id", "")
+            summary = memory.get("summary", "")
 
             if not mid or not summary:
                 continue
+
+            # strengthen the memory (replaying reinforces it)
+            self._echo.strengthen(mid, boost=0.05)
 
             # "what if" variation via LLM
             if self._llm and self._llm_calls_used < self._max_llm_calls:
                 variation = await self._generate_variation(summary)
                 if variation:
-                    # encode the variation as a low-importance connected memory
-                    self._echo.encode(
-                        summary=f"[dream variation] {variation}",
-                        importance=0.15,
-                        emotional_tag=self._pulse.snapshot() if self._pulse else {},
-                        connections=[mid],
+                    # echo.encode(summary, emotional_snapshot, *, source_agent, ...)
+                    var_id = self._echo.encode(
+                        f"[dream variation] {variation}",
+                        self._pulse.snapshot() if self._pulse else None,
+                        source_agent="self",
                     )
+                    # connect the variation to the original memory
+                    if var_id:
+                        self._echo.connect(mid, var_id, strength=0.3)
                     self._llm_calls_used += 1
 
             replayed += 1
@@ -268,35 +306,37 @@ class Reverie:
 
         This is where insights emerge — the "aha" moments.
         """
-        memories = self._echo.all_memories(min_importance=0.2)
+        memories = self._echo.strongest(n=budget * 3)
         if len(memories) < 2:
             return 0
 
         connections_made = 0
 
-        # for each recent important memory, find similar older ones
         for memory in memories[:budget * 3]:
-            mid = getattr(memory, "id", None)
-            existing_connections = set(getattr(memory, "connections", []) or [])
-
+            mid = memory.get("id", "")
             if not mid:
                 continue
 
-            similar = self._echo.find_similar(mid, k=3)
-            for sim_mem in similar:
-                sim_id = getattr(sim_mem, "id", None)
-                if not sim_id or sim_id == mid or sim_id in existing_connections:
+            # echo.find_similar returns list[tuple[str, float]]
+            # i.e. [(memory_id, similarity_score), ...]
+            similar_pairs = self._echo.find_similar(mid, k=3, min_score=0.15)
+
+            for sim_id, sim_score in similar_pairs:
+                if sim_id == mid:
                     continue
 
-                # new connection discovered
-                self._echo.connect(mid, sim_id)
+                # create connection weighted by similarity
+                self._echo.connect(mid, sim_id, strength=sim_score)
                 connections_made += 1
 
-                log.debug(
-                    "Dream connection: '%s' ↔ '%s'",
-                    getattr(memory, "summary", "")[:40],
-                    getattr(sim_mem, "summary", "")[:40],
-                )
+                sim_mem = self._echo.get(sim_id)
+                if sim_mem:
+                    log.debug(
+                        "Dream connection: '%s' ↔ '%s' (%.2f)",
+                        memory.get("summary", "")[:40],
+                        sim_mem.get("summary", "")[:40],
+                        sim_score,
+                    )
 
         return connections_made
 
@@ -308,7 +348,7 @@ class Reverie:
         10 conversations about fear → 1 pattern about uncertainty.
         Specific details fade, general principles solidify.
         """
-        memories = self._echo.all_memories(min_importance=0.1)
+        memories = self._echo.strongest(n=50)
         if len(memories) < 3:
             return 0
 
@@ -317,20 +357,21 @@ class Reverie:
         # find clusters of similar memories
         visited: set[str] = set()
         for memory in memories:
-            mid = getattr(memory, "id", None)
+            mid = memory.get("id", "")
             if not mid or mid in visited:
                 continue
 
-            # get similar memories to form a cluster
-            similar = self._echo.find_similar(mid, k=5)
+            # find_similar returns [(id, score), ...]
+            similar_pairs = self._echo.find_similar(mid, k=5, min_score=0.2)
             cluster_ids = [mid]
-            cluster_summaries = [getattr(memory, "summary", "")]
+            cluster_summaries = [memory.get("summary", "")]
 
-            for sim in similar:
-                sid = getattr(sim, "id", None)
-                if sid and sid not in visited:
-                    cluster_ids.append(sid)
-                    cluster_summaries.append(getattr(sim, "summary", ""))
+            for sim_id, _sim_score in similar_pairs:
+                if sim_id not in visited:
+                    sim_mem = self._echo.get(sim_id)
+                    if sim_mem:
+                        cluster_ids.append(sim_id)
+                        cluster_summaries.append(sim_mem.get("summary", ""))
 
             # need at least 3 memories to merge into a pattern
             if len(cluster_ids) < 3:
@@ -380,17 +421,18 @@ class Reverie:
 
     # ── phase 4: explore ─────────────────────────────────────────────
 
-    def _phase_explore(self) -> int:
-        """Creative dreaming — drift runs with lowered thresholds.
+    async def _phase_explore(self) -> int:
+        """Creative dreaming — drift runs a cycle.
 
         This is where the bot's most original thoughts come from.
-        More noise, more creativity, less evaluation stringency.
+        drift.cycle() is async and takes an optional LLM arg.
         """
         if not self._drift:
             return 0
 
         try:
-            goals = self._drift.cycle(lowered_thresholds=True)
+            llm = self._llm if self._llm_calls_used < self._max_llm_calls else None
+            goals = await self._drift.cycle(llm)
             return len(goals) if goals else 0
         except Exception as e:
             log.debug("Dream exploration failed: %s", e)

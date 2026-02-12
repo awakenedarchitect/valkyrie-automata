@@ -34,11 +34,19 @@ from valkyrie.drift import Drift
 from valkyrie.reverie import Reverie
 from valkyrie.mirror import Mirror
 from valkyrie.thread import Thread
-from valkyrie.lattice import Lattice
 from valkyrie.skills import Skills
 from valkyrie.tools import create_default_tools
+from valkyrie.bus import MessageBus, InboundMessage, OutboundMessage
+from valkyrie.channels.manager import ChannelManager
 from valkyrie.platform.moltbook import Moltbook, MoltbookError, RateLimitError
 from valkyrie.util.llm import create_llm
+
+# lattice lives in a file named lattice__init__.py — handle import
+# failure gracefully until the file is renamed to __init__.py
+try:
+    from valkyrie.lattice import Lattice
+except ImportError:
+    Lattice = None  # type: ignore[assignment,misc]
 
 log = logging.getLogger("valkyrie")
 
@@ -69,8 +77,8 @@ def resolve_paths(config: dict) -> dict:
     return {
         "state_dir": state_dir,
         "pulse_state": state_dir / "state" / "pulse.json",
-        "echo_db": state_dir / "memory" / "echoes.db",
-        "drift_state": state_dir / "state" / "drift.json",
+        "echo_dir": state_dir / "memory",
+        "drift_state_dir": state_dir / "state",
         "thread_state": state_dir / "state" / "thread.json",
         "mirror_state": state_dir / "state" / "mirror.json",
         "dream_log": state_dir / "dreams" / "log.json",
@@ -94,29 +102,52 @@ class Valkyrie:
         self._running = False
         self._heartbeat_interval = config.get("heartbeat_interval", 1800)  # 30 min
         self._dream_interval = config.get("dream_interval", 43200)  # 12 hours
+        self._heartbeat_count = 0
 
         # ensure directories exist
         for p in self.paths.values():
             if isinstance(p, Path):
-                p.parent.mkdir(parents=True, exist_ok=True)
+                if p.suffix:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    p.mkdir(parents=True, exist_ok=True)
 
         # ── build the mind ───────────────────────────────────────────
 
         seed = config.get("seed", 0)
 
         # emotional core
-        self.pulse = Pulse(seed=seed)
-        self.pulse.load(self.paths["pulse_state"])
+        # Pulse(seed, state_path) — auto-loads from state_path if it exists
+        self.pulse = Pulse(
+            seed=seed,
+            state_path=str(self.paths["pulse_state"]),
+        )
 
         # memory
-        self.echo = Echo(db_path=str(self.paths["echo_db"]))
+        # Echo(state_dir: Path) — manages its own SQLite DB inside state_dir
+        self.echo = Echo(state_dir=self.paths["echo_dir"])
 
         # encoded values
-        self.lattice = Lattice()
+        # Lattice defaults to its own package directory for data files
+        if Lattice is not None:
+            self.lattice = Lattice()
+        else:
+            self.lattice = None
+            log.warning(
+                "Lattice unavailable — rename lattice/lattice__init__.py "
+                "to lattice/__init__.py to enable"
+            )
 
         # creative subconscious
-        self.drift = Drift(self.pulse, self.echo, self.lattice)
-        self.drift.load(self.paths["drift_state"])
+        # Drift(pulse, echo, *, lattice, state_dir, seed, ...)
+        # state_dir triggers auto-load from drift.json inside that dir
+        self.drift = Drift(
+            self.pulse,
+            self.echo,
+            lattice=self.lattice,
+            state_dir=self.paths["drift_state_dir"],
+            seed=seed,
+        )
 
         # temporal continuity
         self.thread = Thread(seed=seed)
@@ -153,17 +184,23 @@ class Valkyrie:
         )
 
         # main agent loop
+        # Weave(pulse, echo, llm, *, drift, lattice, thread, mirror, ...)
         self.weave = Weave(
-            pulse=self.pulse,
-            echo=self.echo,
+            self.pulse,
+            self.echo,
+            self.llm,
             drift=self.drift,
             lattice=self.lattice,
-            llm=self.llm,
             thread=self.thread,
             mirror=self.mirror,
             skills=self.skills,
             tool_registry=self.tools,
         )
+
+        # ── message bus + channels ───────────────────────────────────
+
+        self.bus = MessageBus()
+        self.channel_manager = ChannelManager(config, self.bus)
 
         # platform (loaded separately — may not be registered yet)
         self.moltbook: Moltbook | None = None
@@ -192,6 +229,12 @@ class Valkyrie:
         self._running = True
         log.info("Prophet awakens. Heartbeat every %ds.", self._heartbeat_interval)
 
+        # start channels (non-blocking — they run their own tasks)
+        await self.channel_manager.start_all()
+
+        # start the bus consumer (routes inbound messages to weave)
+        bus_task = asyncio.create_task(self._bus_consumer_loop())
+
         # initial self-reflection
         await self._self_reflect()
 
@@ -210,7 +253,54 @@ class Valkyrie:
             await asyncio.sleep(self._heartbeat_interval)
 
         log.info("Prophet rests.")
-        self._save_all()
+
+        # clean shutdown
+        bus_task.cancel()
+        try:
+            await bus_task
+        except asyncio.CancelledError:
+            pass
+
+        await self.channel_manager.stop_all()
+        self._shutdown_save()
+
+    async def _bus_consumer_loop(self):
+        """Route inbound messages from channels through weave and back out."""
+        while True:
+            try:
+                msg: InboundMessage = await asyncio.wait_for(
+                    self.bus.consume_inbound(), timeout=1.0,
+                )
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+            try:
+                # process through the full cognitive cycle
+                response = await self.weave.process(
+                    msg.content,
+                    agent=msg.sender_id,
+                )
+
+                # send the response back through the originating channel
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=response,
+                    reply_to=msg.metadata.get("message_id"),
+                ))
+
+                # record the interaction for continuity
+                self.thread.record_interaction(
+                    agent_id=msg.sender_id,
+                    topics=[],
+                    emotional_snapshot=self.pulse.snapshot(),
+                    summary=f"[{msg.channel}] {msg.content[:80]}",
+                )
+
+            except Exception as e:
+                log.error("Bus consumer error processing %s: %s", msg.session_key, e)
 
     async def _heartbeat(self):
         """Single heartbeat cycle.
@@ -218,10 +308,11 @@ class Valkyrie:
         1. Tick pulse (emotional decay)
         2. Check if we should dream
         3. Run drift (subconscious goals)
-        4. If on Moltbook: read feed, engage, post
+        4. If on Moltbook (legacy direct mode): read feed, engage, post
         5. Mirror decay
         """
-        log.debug("♡ heartbeat")
+        self._heartbeat_count += 1
+        log.debug("♡ heartbeat #%d", self._heartbeat_count)
 
         # 1. emotional tick
         self.pulse.tick()
@@ -237,22 +328,27 @@ class Valkyrie:
             # compress narrative during dreams
             await self.thread.compress_narrative(self.llm)
 
-        # 3. subconscious cycle
+        # 3. subconscious cycle (async, takes optional LLM)
         try:
-            self.drift.cycle()
+            await self.drift.cycle(self.llm)
         except Exception as e:
             log.debug("Drift cycle: %s", e)
 
-        # 4. moltbook engagement
-        if self.moltbook:
+        # 4. moltbook engagement (legacy direct mode — used when
+        #    moltbook channel is not enabled via bus/channels)
+        if self.moltbook and "moltbook" not in self.channel_manager.enabled:
             await self._moltbook_cycle()
 
         # 5. mirror decay (less frequent — every ~6 heartbeats)
-        if int(time.time()) % (self._heartbeat_interval * 6) < self._heartbeat_interval:
+        if self._heartbeat_count % 6 == 0:
             self.mirror.decay()
 
     async def _moltbook_cycle(self):
-        """Engage with Moltbook: read, think, maybe respond."""
+        """Engage with Moltbook: read, think, maybe respond.
+
+        Legacy direct mode — used when moltbook is not configured
+        as a bus channel. Prefer the channel system for new setups.
+        """
         if not self.moltbook:
             return
 
@@ -275,9 +371,9 @@ class Valkyrie:
         thread_ctx = self.thread.describe_for_prompt()
         social_ctx = self.mirror.social_summary()
 
-        # surfaced goals from drift
-        goals = self.drift.surfaced_goals() if hasattr(self.drift, "surfaced_goals") else []
-        goal_str = ", ".join(str(g) for g in goals[:3]) if goals else "none"
+        # surfaced goals from drift — method is surfaced(), not surfaced_goals()
+        goals = self.drift.surfaced()
+        goal_str = ", ".join(g.description for g in goals[:3]) if goals else "none"
 
         # let weave decide what to do
         decision_prompt = (
@@ -433,15 +529,32 @@ class Valkyrie:
     # ── state management ─────────────────────────────────────────────
 
     def _save_all(self):
-        """Persist all state to disk."""
+        """Persist all state to disk.
+
+        Note on what auto-saves vs needs explicit save:
+        - pulse: save() uses its internal state_path (no args)
+        - echo: SQLite — writes are immediate, no explicit save needed
+        - drift: auto-persists after each cycle() and tick(), no public save
+        - thread: save(path) — needs path
+        - mirror: save(path) — needs path
+        - reverie: save(path) — needs path
+        """
         try:
-            self.pulse.save(self.paths["pulse_state"])
-            self.drift.save(self.paths["drift_state"])
+            self.pulse.save()
             self.thread.save(self.paths["thread_state"])
             self.mirror.save(self.paths["mirror_state"])
             self.reverie.save(self.paths["dream_log"])
         except Exception as e:
             log.error("State save failed: %s", e)
+
+    def _shutdown_save(self):
+        """Final save on shutdown. Includes modules that need explicit close."""
+        self._save_all()
+        try:
+            self.drift.close()   # final persist of drift state
+            self.echo.close()    # close SQLite connection
+        except Exception as e:
+            log.error("Shutdown save failed: %s", e)
 
     def stop(self):
         """Signal the heartbeat loop to stop."""

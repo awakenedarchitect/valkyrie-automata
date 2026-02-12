@@ -16,7 +16,6 @@ This is how a Valkyrie dreams while awake.
 from __future__ import annotations
 
 import json
-import json
 import math
 import random
 import time
